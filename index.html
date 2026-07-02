@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>5-Year Weather Averages</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root{
+    --bg:#0f172a; --card:#1e293b; --accent:#38bdf8; --text:#e2e8f0; --muted:#94a3b8;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; font-family:'Segoe UI',Arial,sans-serif; background:var(--bg); color:var(--text);
+    padding:20px;
+  }
+  h1{ text-align:center; font-size:1.6rem; margin-bottom:4px;}
+  p.subtitle{ text-align:center; color:var(--muted); margin-top:0; margin-bottom:20px;}
+
+  .controls{
+    max-width:700px; margin:0 auto 20px auto; background:var(--card);
+    padding:16px; border-radius:12px; display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+  }
+  .search-wrap{ position:relative; flex:1 1 220px; }
+  input[type=text], input[type=date]{
+    width:100%; padding:10px; border-radius:8px; border:1px solid #334155;
+    background:#0f172a; color:var(--text); font-size:0.95rem;
+  }
+  #suggestions{
+    position:absolute; top:100%; left:0; right:0; background:#0f172a; border:1px solid #334155;
+    border-radius:8px; max-height:200px; overflow-y:auto; z-index:10; display:none;
+  }
+  #suggestions div{ padding:8px 10px; cursor:pointer; }
+  #suggestions div:hover{ background:#1e293b; }
+
+  button, .toggle-btn{
+    padding:10px 16px; border-radius:8px; border:none; background:var(--accent);
+    color:#0f172a; font-weight:bold; cursor:pointer;
+  }
+  .toggle-btn.secondary{ background:#334155; color:var(--text); }
+
+  #status{ text-align:center; color:var(--muted); margin-bottom:10px; min-height:20px;}
+
+  .grid{
+    max-width:900px; margin:0 auto; display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+    gap:14px;
+  }
+  .card{
+    background:var(--card); padding:16px; border-radius:12px;
+  }
+  .card h3{ margin:0 0 8px 0; font-size:0.95rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px;}
+  .card .big{ font-size:1.8rem; font-weight:bold; }
+  .card .small{ color:var(--muted); font-size:0.85rem; margin-top:4px;}
+
+  .charts{
+    max-width:900px; margin:20px auto; display:grid; grid-template-columns:1fr; gap:20px;
+  }
+  @media(min-width:700px){ .charts{ grid-template-columns:1fr 1fr; } }
+  .chart-box{ background:var(--card); padding:16px; border-radius:12px; }
+
+  footer{ text-align:center; color:var(--muted); margin-top:30px; font-size:0.8rem;}
+</style>
+</head>
+<body>
+
+  <h1>🌦️ 5-Year Weather Averages</h1>
+  <p class="subtitle">Pick a city and a date to see historical climate averages (free, no API key)</p>
+
+  <div class="controls">
+    <div class="search-wrap">
+      <input type="text" id="citySearch" placeholder="Search a city (e.g. Pune)" autocomplete="off">
+      <div id="suggestions"></div>
+    </div>
+    <input type="date" id="dateInput">
+    <button id="unitToggle" class="toggle-btn secondary">°C / km/h</button>
+    <button id="fetchBtn">Get Averages</button>
+  </div>
+
+  <div id="status"></div>
+
+  <div class="grid" id="resultsGrid" style="display:none;">
+    <div class="card">
+      <h3>Location</h3>
+      <div class="big" id="locName">-</div>
+      <div class="small" id="locCoords"></div>
+    </div>
+
+    <div class="card">
+      <h3>Avg High / Low Temp</h3>
+      <div class="big" id="tempAvg">-</div>
+      <div class="small" id="tempStd"></div>
+    </div>
+
+    <div class="card">
+      <h3>Precipitation</h3>
+      <div class="big" id="precipChance">-</div>
+      <div class="small" id="precipAmount"></div>
+    </div>
+
+    <div class="card">
+      <h3>Wind & Humidity</h3>
+      <div class="big" id="windSpeed">-</div>
+      <div class="small" id="windHumidity"></div>
+    </div>
+
+    <div class="card">
+      <h3>Sunrise / Sunset</h3>
+      <div class="big" id="sunTimes">-</div>
+      <div class="small" id="daylightHrs"></div>
+    </div>
+  </div>
+
+  <div class="charts" id="chartsWrap" style="display:none;">
+    <div class="chart-box"><canvas id="tempChart"></canvas></div>
+    <div class="chart-box"><canvas id="precipChart"></canvas></div>
+  </div>
+
+  <footer>Data source: Open-Meteo.com (free, no key required)</footer>
+
+<script>
+  // ---------- STATE ----------
+  let state = {
+    lat: null, lon: null, name: "",
+    unit: "metric", // metric or imperial
+    yearsRaw: []    // array of {year, tmax, tmin, precip, wind, windDir, humidity, sunrise, sunset, daylight}
+  };
+
+  // ---------- DOM ----------
+  const citySearch = document.getElementById('citySearch');
+  const suggestions = document.getElementById('suggestions');
+  const dateInput = document.getElementById('dateInput');
+  const unitToggle = document.getElementById('unitToggle');
+  const fetchBtn = document.getElementById('fetchBtn');
+  const statusEl = document.getElementById('status');
+  const resultsGrid = document.getElementById('resultsGrid');
+  const chartsWrap = document.getElementById('chartsWrap');
+
+  // default date = today
+  dateInput.value = new Date().toISOString().split('T')[0];
+
+  let tempChartInstance = null;
+  let precipChartInstance = null;
+
+  // ---------- CITY SEARCH (Geocoding) ----------
+  let searchTimeout;
+  citySearch.addEventListener('input', () => {
+    clearTimeout(searchTimeout);
+    const q = citySearch.value.trim();
+    if (q.length < 2) { suggestions.style.display = 'none'; return; }
+    searchTimeout = setTimeout(() => geocodeCity(q), 400);
+  });
+
+  async function geocodeCity(query) {
+    try {
+      const res = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(query)}&count=6&language=en&format=json`);
+      const data = await res.json();
+      suggestions.innerHTML = '';
+      if (!data.results || data.results.length === 0) {
+        suggestions.style.display = 'none';
+        return;
+      }
+      data.results.forEach(place => {
+        const div = document.createElement('div');
+        const region = place.admin1 ? `, ${place.admin1}` : '';
+        div.textContent = `${place.name}${region}, ${place.country}`;
+        div.addEventListener('click', () => {
+          state.lat = place.latitude;
+          state.lon = place.longitude;
+          state.name = `${place.name}${region}, ${place.country}`;
+          citySearch.value = state.name;
+          suggestions.style.display = 'none';
+        });
+        suggestions.appendChild(div);
+      });
+      suggestions.style.display = 'block';
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  // hide suggestions if clicking elsewhere
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.search-wrap')) suggestions.style.display = 'none';
+  });
+
+  // ---------- UNIT TOGGLE ----------
+  unitToggle.addEventListener('click', () => {
+    state.unit = state.unit === 'metric' ? 'imperial' : 'metric';
+    unitToggle.textContent = state.unit === 'metric' ? '°C / km/h' : '°F / mph';
+    if (state.yearsRaw.length) renderResults(); // re-render with new units
+  });
+
+  // ---------- MAIN FETCH ----------
+  fetchBtn.addEventListener('click', async () => {
+    if (state.lat === null) {
+      statusEl.textContent = "Please search and select a city first.";
+      return;
+    }
+    const dateVal = dateInput.value;
+    if (!dateVal) { statusEl.textContent = "Please pick a date."; return; }
+
+    const [ , month, day ] = dateVal.split('-'); // ignore chosen year, we use last 5 years
+    statusEl.textContent = "Fetching last 5 years of data...";
+    resultsGrid.style.display = 'none';
+    chartsWrap.style.display = 'none';
+
+    const currentYear = new Date().getFullYear();
+    const targetYears = [1,2,3,4,5].map(offset => currentYear - offset);
+
+    try {
+      const requests = targetYears.map(year => {
+        const dateStr = `${year}-${month}-${day}`;
+        const url = `https://archive-api.open-meteo.com/v1/archive?latitude=${state.lat}&longitude=${state.lon}&start_date=${dateStr}&end_date=${dateStr}&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max,winddirection_10m_dominant,relative_humidity_2m_mean,sunrise,sunset,daylight_duration&timezone=auto`;
+        return fetch(url).then(r => r.json());
+      });
+
+      const results = await Promise.all(requests);
+
+      state.yearsRaw = results.map((r, i) => {
+        const d = r.daily;
+        return {
+          year: targetYears[i],
+          tmax: d.temperature_2m_max ? d.temperature_2m_max[0] : null,
+          tmin: d.temperature_2m_min ? d.temperature_2m_min[0] : null,
+          precip: d.precipitation_sum ? d.precipitation_sum[0] : null,
+          wind: d.windspeed_10m_max ? d.windspeed_10m_max[0] : null,
+          windDir: d.winddirection_10m_dominant ? d.winddirection_10m_dominant[0] : null,
+          humidity: d.relative_humidity_2m_mean ? d.relative_humidity_2m_mean[0] : null,
+          sunrise: d.sunrise ? d.sunrise[0] : null,
+          sunset: d.sunset ? d.sunset[0] : null,
+          daylight: d.daylight_duration ? d.daylight_duration[0] : null
+        };
+      }).filter(y => y.tmax !== null); // drop any failed years
+
+      if (state.yearsRaw.length === 0) {
+        statusEl.textContent = "No data found for this location/date. Try another city.";
+        return;
+      }
+
+      statusEl.textContent = `Showing ${state.yearsRaw.length}-year average for ${month}/${day}`;
+      renderResults();
+
+    } catch (err) {
+      console.error(err);
+      statusEl.textContent = "Something went wrong fetching data. Please try again.";
+    }
+  });
+
+  // ---------- STATS HELPERS ----------
+  function mean(arr) { return arr.reduce((a,b)=>a+b,0) / arr.length; }
+  function stdDev(arr) {
+    const m = mean(arr);
+    const variance = mean(arr.map(x => (x-m)**2));
+    return Math.sqrt(variance);
+  }
+  function cToF(c) { return (c * 9/5) + 32; }
+  function kmhToMph(kmh) { return kmh * 0.621371; }
+
+  // circular mean for wind direction (degrees)
+  function circularMeanDeg(degrees) {
+    const rads = degrees.map(d => d * Math.PI / 180);
+    const sinSum = mean(rads.map(Math.sin));
+    const cosSum = mean(rads.map(Math.cos));
+    let deg = Math.atan2(sinSum, cosSum) * 180 / Math.PI;
+    if (deg < 0) deg += 360;
+    return deg;
+  }
+  function degToCompass(deg) {
+    const dirs = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
+    return dirs[Math.round(deg / 22.5) % 16];
+  }
+
+  // average clock time from ISO strings like "2023-07-15T05:32"
+  function averageTimeString(isoStrings) {
+    const minutesList = isoStrings.map(s => {
+      const timePart = s.split('T')[1]; // "05:32"
+      const [h,m] = timePart.split(':').map(Number);
+      return h*60 + m;
+    });
+    const avgMin = Math.round(mean(minutesList));
+    const h = Math.floor(avgMin / 60).toString().padStart(2,'0');
+    const m = (avgMin % 60).toString().padStart(2,'0');
+    return `${h}:${m}`;
+  }
+
+  // ---------- RENDER ----------
+  function renderResults() {
+    const y = state.yearsRaw;
+    const isMetric = state.unit === 'metric';
+
+    // Temperature
+    const tmaxVals = y.map(v => v.tmax);
+    const tminVals = y.map(v => v.tmin);
+    let avgMax = mean(tmaxVals), avgMin = mean(tminVals);
+    let stdMax = stdDev(tmaxVals), stdMin = stdDev(tminVals);
+    if (!isMetric) {
+      avgMax = cToF(avgMax); avgMin = cToF(avgMin);
+      stdMax = stdMax * 9/5; stdMin = stdMin * 9/5; // std dev scales by 9/5 for F, no +32 shift
+    }
+    const tempUnit = isMetric ? '°C' : '°F';
+    document.getElementById('tempAvg').textContent = `${avgMax.toFixed(1)}${tempUnit} / ${avgMin.toFixed(1)}${tempUnit}`;
+    document.getElementById('tempStd').textContent = `± ${stdMax.toFixed(1)}${tempUnit} high, ± ${stdMin.toFixed(1)}${tempUnit} low (typical variation)`;
+
+    // Precipitation
+    const precipVals = y.map(v => v.precip ?? 0);
+    const rainyDays = precipVals.filter(p => p > 0.1).length;
+    const precipChance = (rainyDays / y.length) * 100;
+    let avgPrecip = mean(precipVals);
+    let precipUnit = 'mm';
+    if (!isMetric) { avgPrecip = avgPrecip / 25.4; precipUnit = 'in'; }
+    document.getElementById('precipChance').textContent = `${precipChance.toFixed(0)}% chance`;
+    document.getElementById('precipAmount').textContent = `Avg amount: ${avgPrecip.toFixed(2)} ${precipUnit}`;
+
+    // Wind & Humidity
+    const windVals = y.filter(v => v.wind !== null).map(v => v.wind);
+    const windDirVals = y.filter(v => v.windDir !== null).map(v => v.windDir);
+    const humidityVals = y.filter(v => v.humidity !== null).map(v => v.humidity);
+    let avgWind = windVals.length ? mean(windVals) : null;
+    let windUnit = 'km/h';
+    if (avgWind !== null && !isMetric) { avgWind = kmhToMph(avgWind); windUnit = 'mph'; }
+    const avgHumidity = humidityVals.length ? mean(humidityVals) : null;
+    const avgDir = windDirVals.length ? circularMeanDeg(windDirVals) : null;
+
+    document.getElementById('windSpeed').textContent = avgWind !== null ? `${avgWind.toFixed(1)} ${windUnit}` : 'N/A';
+    document.getElementById('windHumidity').textContent =
+      `${avgDir !== null ? 'Direction: ' + degToCompass(avgDir) : ''} ${avgHumidity !== null ? '| Humidity: ' + avgHumidity.toFixed(0) + '%' : ''}`;
+
+    // Sunrise/Sunset/Daylight
+    const sunriseVals = y.filter(v => v.sunrise).map(v => v.sunrise);
+    const sunsetVals = y.filter(v => v.sunset).map(v => v.sunset);
+    const daylightVals = y.filter(v => v.daylight).map(v => v.daylight);
+    const avgSunrise = sunriseVals.length ? averageTimeString(sunriseVals) : '-';
+    const avgSunset = sunsetVals.length ? averageTimeString(sunsetVals) : '-';
+    const avgDaylightHrs = daylightVals.length ? mean(daylightVals) / 3600 : null;
+
+    document.getElementById('sunTimes').textContent = `${avgSunrise} - ${avgSunset}`;
+    document.getElementById('daylightHrs').textContent = avgDaylightHrs !== null ? `${avgDaylightHrs.toFixed(1)} hrs of daylight` : '';
+
+    // Location card
+    document.getElementById('locName').textContent = state.name;
+    document.getElementById('locCoords').textContent = `Lat ${state.lat.toFixed(2)}, Lon ${state.lon.toFixed(2)} — based on ${y.length} years`;
+
+    resultsGrid.style.display = 'grid';
+    chartsWrap.style.display = 'grid';
+
+    renderCharts(y, isMetric);
+  }
+
+  function renderCharts(y, isMetric) {
+    const sorted = [...y].sort((a,b) => a.year - b.year);
+    const labels = sorted.map(v => v.year);
+    let maxVals = sorted.map(v => isMetric ? v.tmax : cToF(v.tmax));
+    let minVals = sorted.map(v => isMetric ? v.tmin : cToF(v.tmin));
+    let precipVals = sorted.map(v => isMetric ? (v.precip ?? 0) : (v.precip ?? 0)/25.4);
+
+    if (tempChartInstance) tempChartInstance.destroy();
+    if (precipChartInstance) precipChartInstance.destroy();
+
+    const tempCtx = document.getElementById('tempChart').getContext('2d');
+    tempChartInstance = new Chart(tempCtx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          { label: `High (${isMetric?'°C':'°F'})`, data: maxVals, borderColor:'#f97316', backgroundColor:'#f97316', tension:0.3 },
+          { label: `Low (${isMetric?'°C':'°F'})`, data: minVals, borderColor:'#38bdf8', backgroundColor:'#38bdf8', tension:0.3 }
+        ]
+      },
+      options: { plugins:{ title:{ display:true, text:'Temperature trend (last 5 years, this date)', color:'#e2e8f0'}, legend:{labels:{color:'#e2e8f0'}}},
+        scales:{ x:{ticks:{color:'#94a3b8'}}, y:{ticks:{color:'#94a3b8'}}}}
+    });
+
+    const precipCtx = document.getElementById('precipChart').getContext('2d');
+    precipChartInstance = new Chart(precipCtx, {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [{ label: `Precipitation (${isMetric?'mm':'in'})`, data: precipVals, backgroundColor:'#38bdf8' }]
+      },
+      options: { plugins:{ title:{ display:true, text:'Precipitation by year (this date)', color:'#e2e8f0'}, legend:{labels:{color:'#e2e8f0'}}},
+        scales:{ x:{ticks:{color:'#94a3b8'}}, y:{ticks:{color:'#94a3b8'}}}}
+    });
+  }
+</script>
+</body>
+</html>
