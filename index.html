@@ -18,7 +18,7 @@
   p.subtitle{ text-align:center; color:var(--muted); margin-top:0; margin-bottom:20px;}
 
   .controls{
-    max-width:700px; margin:0 auto 20px auto; background:var(--card);
+    max-width:700px; margin:0 auto 12px auto; background:var(--card);
     padding:16px; border-radius:12px; display:flex; flex-wrap:wrap; gap:10px; align-items:center;
   }
   .search-wrap{ position:relative; flex:1 1 220px; }
@@ -31,15 +31,36 @@
     border-radius:8px; max-height:200px; overflow-y:auto; z-index:10; display:none;
   }
   #suggestions div{ padding:8px 10px; cursor:pointer; }
-  #suggestions div:hover{ background:#1e293b; }
+  #suggestions div:hover, #suggestions div.active{ background:#1e293b; }
 
   button, .toggle-btn{
     padding:10px 16px; border-radius:8px; border:none; background:var(--accent);
     color:#0f172a; font-weight:bold; cursor:pointer;
   }
   .toggle-btn.secondary{ background:#334155; color:var(--text); }
+  button:disabled{ opacity:0.6; cursor:not-allowed; }
 
-  #status{ text-align:center; color:var(--muted); margin-bottom:10px; min-height:20px;}
+  /* Recent / favorite cities */
+  .chips-wrap{
+    max-width:700px; margin:0 auto 20px auto; display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+  }
+  .chip{
+    display:flex; align-items:center; gap:6px; background:var(--card); border:1px solid #334155;
+    padding:6px 10px; border-radius:20px; font-size:0.82rem; cursor:pointer; color:var(--text);
+  }
+  .chip:hover{ border-color:var(--accent); }
+  .chip .star{ cursor:pointer; color:#fbbf24; font-size:0.9rem; }
+  .chip .star.off{ color:#475569; }
+  .chip-label{ color:var(--muted); font-size:0.8rem; margin-right:2px; }
+
+  #status{ text-align:center; color:var(--muted); margin-bottom:10px; min-height:20px; display:flex; align-items:center; justify-content:center; gap:8px;}
+
+  .spinner{
+    width:16px; height:16px; border:2px solid #334155; border-top-color:var(--accent);
+    border-radius:50%; animation:spin 0.8s linear infinite; display:none;
+  }
+  .spinner.show{ display:inline-block; }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
 
   .grid{
     max-width:900px; margin:0 auto; display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
@@ -57,6 +78,11 @@
   }
   @media(min-width:700px){ .charts{ grid-template-columns:1fr 1fr; } }
   .chart-box{ background:var(--card); padding:16px; border-radius:12px; }
+
+  .error-detail{
+    color:#f87171; font-size:0.75rem; margin-top:4px; max-width:700px; margin-left:auto; margin-right:auto;
+    text-align:center; word-break:break-word;
+  }
 
   footer{ text-align:center; color:var(--muted); margin-top:30px; font-size:0.8rem;}
 </style>
@@ -76,7 +102,13 @@
     <button id="fetchBtn">Get Averages</button>
   </div>
 
-  <div id="status"></div>
+  <div class="chips-wrap" id="chipsWrap"></div>
+
+  <div id="status">
+    <span class="spinner" id="spinner"></span>
+    <span id="statusText"></span>
+  </div>
+  <div class="error-detail" id="errorDetail"></div>
 
   <div class="grid" id="resultsGrid" style="display:none;">
     <div class="card">
@@ -125,15 +157,21 @@
     yearsRaw: []    // array of {year, tmax, tmin, precip, wind, windDir, humidity, sunrise, sunset, daylight}
   };
 
+  let activeSuggestionIndex = -1;
+  let lastSuggestions = [];
+
   // ---------- DOM ----------
   const citySearch = document.getElementById('citySearch');
   const suggestions = document.getElementById('suggestions');
   const dateInput = document.getElementById('dateInput');
   const unitToggle = document.getElementById('unitToggle');
   const fetchBtn = document.getElementById('fetchBtn');
-  const statusEl = document.getElementById('status');
+  const statusText = document.getElementById('statusText');
+  const errorDetail = document.getElementById('errorDetail');
+  const spinner = document.getElementById('spinner');
   const resultsGrid = document.getElementById('resultsGrid');
   const chartsWrap = document.getElementById('chartsWrap');
+  const chipsWrap = document.getElementById('chipsWrap');
 
   // default date = today
   dateInput.value = new Date().toISOString().split('T')[0];
@@ -141,41 +179,177 @@
   let tempChartInstance = null;
   let precipChartInstance = null;
 
+  function setError(msg) {
+    errorDetail.textContent = msg || '';
+  }
+
+  // ---------- RECENT / FAVORITE CITIES (in-memory, since localStorage isn't
+  // available in this sandboxed environment) ----------
+  let citiesMemory = [];
+
+  function loadCities() {
+    return citiesMemory;
+  }
+
+  function saveCities(list) {
+    citiesMemory = list;
+  }
+
+  function rememberCity(place) {
+    let list = loadCities();
+    // remove duplicate (same name) if already present
+    list = list.filter(c => c.name !== place.name);
+    list.unshift({ ...place, favorite: false });
+    if (list.length > 8) list = list.slice(0, 8);
+    saveCities(list);
+    renderChips();
+  }
+
+  function toggleFavorite(name) {
+    const list = loadCities();
+    const item = list.find(c => c.name === name);
+    if (item) item.favorite = !item.favorite;
+    saveCities(list);
+    renderChips();
+  }
+
+  function renderChips() {
+    const list = loadCities();
+    chipsWrap.innerHTML = '';
+    if (list.length === 0) return;
+
+    // favorites first, then recents, most recent first within each group
+    const favs = list.filter(c => c.favorite);
+    const recents = list.filter(c => !c.favorite);
+
+    if (favs.length) {
+      const label = document.createElement('span');
+      label.className = 'chip-label';
+      label.textContent = 'Favorites:';
+      chipsWrap.appendChild(label);
+      favs.forEach(c => chipsWrap.appendChild(buildChip(c)));
+    }
+    if (recents.length) {
+      const label = document.createElement('span');
+      label.className = 'chip-label';
+      label.textContent = 'Recent:';
+      chipsWrap.appendChild(label);
+      recents.forEach(c => chipsWrap.appendChild(buildChip(c)));
+    }
+  }
+
+  function buildChip(c) {
+    const chip = document.createElement('div');
+    chip.className = 'chip';
+
+    const star = document.createElement('span');
+    star.className = 'star' + (c.favorite ? '' : ' off');
+    star.textContent = '★';
+    star.title = c.favorite ? 'Unfavorite' : 'Favorite';
+    star.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleFavorite(c.name);
+    });
+
+    const label = document.createElement('span');
+    label.textContent = c.name;
+
+    chip.appendChild(star);
+    chip.appendChild(label);
+
+    chip.addEventListener('click', () => {
+      state.lat = c.lat;
+      state.lon = c.lon;
+      state.name = c.name;
+      citySearch.value = c.name;
+      fetchBtn.click();
+    });
+
+    return chip;
+  }
+
+  renderChips();
+
   // ---------- CITY SEARCH (Geocoding) ----------
   let searchTimeout;
   citySearch.addEventListener('input', () => {
+    // typing invalidates any previously selected city
+    state.lat = null;
+    state.lon = null;
+    activeSuggestionIndex = -1;
     clearTimeout(searchTimeout);
     const q = citySearch.value.trim();
-    if (q.length < 2) { suggestions.style.display = 'none'; return; }
+    if (q.length < 2) { suggestions.style.display = 'none'; lastSuggestions = []; return; }
     searchTimeout = setTimeout(() => geocodeCity(q), 400);
   });
+
+  citySearch.addEventListener('keydown', (e) => {
+    if (suggestions.style.display === 'block' && lastSuggestions.length) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        activeSuggestionIndex = Math.min(activeSuggestionIndex + 1, lastSuggestions.length - 1);
+        highlightSuggestion();
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        activeSuggestionIndex = Math.max(activeSuggestionIndex - 1, 0);
+        highlightSuggestion();
+        return;
+      }
+      if (e.key === 'Enter' && activeSuggestionIndex >= 0) {
+        e.preventDefault();
+        selectPlace(lastSuggestions[activeSuggestionIndex]);
+        return;
+      }
+    }
+    if (e.key === 'Enter') {
+      // no suggestion actively highlighted: just trigger the search/fetch
+      e.preventDefault();
+      fetchBtn.click();
+    }
+  });
+
+  function highlightSuggestion() {
+    [...suggestions.children].forEach((el, i) => {
+      el.classList.toggle('active', i === activeSuggestionIndex);
+    });
+  }
 
   async function geocodeCity(query) {
     try {
       const res = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(query)}&count=6&language=en&format=json`);
+      if (!res.ok) throw new Error(`Geocoding API returned status ${res.status}`);
       const data = await res.json();
       suggestions.innerHTML = '';
-      if (!data.results || data.results.length === 0) {
+      lastSuggestions = data.results || [];
+      activeSuggestionIndex = -1;
+      if (lastSuggestions.length === 0) {
         suggestions.style.display = 'none';
         return;
       }
-      data.results.forEach(place => {
+      lastSuggestions.forEach(place => {
         const div = document.createElement('div');
         const region = place.admin1 ? `, ${place.admin1}` : '';
         div.textContent = `${place.name}${region}, ${place.country}`;
-        div.addEventListener('click', () => {
-          state.lat = place.latitude;
-          state.lon = place.longitude;
-          state.name = `${place.name}${region}, ${place.country}`;
-          citySearch.value = state.name;
-          suggestions.style.display = 'none';
-        });
+        div.addEventListener('click', () => selectPlace(place));
         suggestions.appendChild(div);
       });
       suggestions.style.display = 'block';
     } catch (err) {
-      console.error(err);
+      console.error('Geocoding suggestion fetch failed:', err);
+      // Suggestions are non-critical, so fail silently in the UI but log it
+      suggestions.style.display = 'none';
     }
+  }
+
+  function selectPlace(place) {
+    const region = place.admin1 ? `, ${place.admin1}` : '';
+    state.lat = place.latitude;
+    state.lon = place.longitude;
+    state.name = `${place.name}${region}, ${place.country}`;
+    citySearch.value = state.name;
+    suggestions.style.display = 'none';
   }
 
   // hide suggestions if clicking elsewhere
@@ -192,15 +366,48 @@
 
   // ---------- MAIN FETCH ----------
   fetchBtn.addEventListener('click', async () => {
-    if (state.lat === null) {
-      statusEl.textContent = "Please search and select a city first.";
+    setError('');
+    const typed = citySearch.value.trim();
+    if (!typed) {
+      statusText.textContent = "Type a city name first.";
       return;
     }
+
+    // If no suggestion was clicked (state.lat is null), auto-resolve
+    // whatever text is currently in the box using the first geocoding match.
+    if (state.lat === null) {
+      statusText.textContent = "Looking up that city...";
+      spinner.classList.add('show');
+      try {
+        const res = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(typed)}&count=1&language=en&format=json`);
+        if (!res.ok) throw new Error(`Geocoding API returned status ${res.status}`);
+        const data = await res.json();
+        if (!data.results || data.results.length === 0) {
+          spinner.classList.remove('show');
+          statusText.textContent = `Couldn't find "${typed}". Try a different spelling or a nearby major city.`;
+          return;
+        }
+        selectPlace(data.results[0]);
+      } catch (err) {
+        spinner.classList.remove('show');
+        statusText.textContent = "Couldn't reach the geocoding service. Check your connection and try again.";
+        setError(err.message || String(err));
+        console.error('Geocoding lookup failed:', err);
+        return;
+      }
+    }
+
     const dateVal = dateInput.value;
-    if (!dateVal) { statusEl.textContent = "Please pick a date."; return; }
+    if (!dateVal) {
+      spinner.classList.remove('show');
+      statusText.textContent = "Please pick a date.";
+      return;
+    }
 
     const [ , month, day ] = dateVal.split('-'); // ignore chosen year, we use last 5 years
-    statusEl.textContent = "Fetching last 5 years of data...";
+    spinner.classList.add('show');
+    statusText.textContent = "Fetching last 5 years of data...";
+    fetchBtn.disabled = true;
     resultsGrid.style.display = 'none';
     chartsWrap.style.display = 'none';
 
@@ -211,13 +418,25 @@
       const requests = targetYears.map(year => {
         const dateStr = `${year}-${month}-${day}`;
         const url = `https://archive-api.open-meteo.com/v1/archive?latitude=${state.lat}&longitude=${state.lon}&start_date=${dateStr}&end_date=${dateStr}&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max,winddirection_10m_dominant,relative_humidity_2m_mean,sunrise,sunset,daylight_duration&timezone=auto`;
-        return fetch(url).then(r => r.json());
+        return fetch(url).then(r => {
+          if (!r.ok) throw new Error(`Archive API returned status ${r.status} for ${year}`);
+          return r.json();
+        });
       });
 
-      const results = await Promise.all(requests);
+      // Use allSettled so a single failed year doesn't kill the whole request
+      const settled = await Promise.allSettled(requests);
 
-      state.yearsRaw = results.map((r, i) => {
-        const d = r.daily;
+      const failures = settled.filter(s => s.status === 'rejected');
+      if (failures.length) {
+        console.warn(`${failures.length} of ${targetYears.length} year requests failed:`,
+          failures.map(f => f.reason && f.reason.message));
+      }
+
+      state.yearsRaw = settled.map((s, i) => {
+        if (s.status !== 'fulfilled') return null;
+        const d = s.value.daily;
+        if (!d) return null;
         return {
           year: targetYears[i],
           tmax: d.temperature_2m_max ? d.temperature_2m_max[0] : null,
@@ -230,19 +449,30 @@
           sunset: d.sunset ? d.sunset[0] : null,
           daylight: d.daylight_duration ? d.daylight_duration[0] : null
         };
-      }).filter(y => y.tmax !== null); // drop any failed years
+      }).filter(y => y && y.tmax !== null); // drop any failed/empty years
 
       if (state.yearsRaw.length === 0) {
-        statusEl.textContent = "No data found for this location/date. Try another city.";
+        statusText.textContent = "No data found for this location/date. Try another city.";
+        if (failures.length) {
+          setError(failures[0].reason ? failures[0].reason.message : 'All requests failed.');
+        }
+        spinner.classList.remove('show');
+        fetchBtn.disabled = false;
         return;
       }
 
-      statusEl.textContent = `Showing ${state.yearsRaw.length}-year average for ${month}/${day}`;
+      const partialNote = failures.length ? ` (${failures.length} year${failures.length>1?'s':''} unavailable)` : '';
+      statusText.textContent = `Showing ${state.yearsRaw.length}-year average for ${month}/${day}${partialNote}`;
       renderResults();
+      rememberCity({ name: state.name, lat: state.lat, lon: state.lon });
 
     } catch (err) {
-      console.error(err);
-      statusEl.textContent = "Something went wrong fetching data. Please try again.";
+      console.error('Weather data fetch failed:', err);
+      statusText.textContent = "Something went wrong fetching data. Please try again.";
+      setError(err.message || String(err));
+    } finally {
+      spinner.classList.remove('show');
+      fetchBtn.disabled = false;
     }
   });
 
